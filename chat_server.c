@@ -58,40 +58,9 @@ char *getStatusString(int status) {
     return result;
 }
 
-Chat__UserInfo *find_user(char *username) {
-    for (int i = 0; i < cantidad_clientes; i++) {
-        if (strcmp(clients[i].username, username) == 0) {
-            Chat__UserInfo *user_find_response = malloc(sizeof(Chat__UserInfo));
-            chat__user_info__init(user_find_response);
-            user_find_response->username = strdup(clients[i].username);
-            user_find_response->ip = strdup(clients[i].user_ip);
-            user_find_response->status = getStatusString(clients[i].status);
-            return user_find_response;
-        }
-    }
-    return NULL;
-}
-
-void update_user_status(char *username, char *ip, Client cliente) {
-    for (int i = 0; i < cantidad_clientes; i++) {
-        if (strcmp(clients[i].username, username) == 0 && strcmp(clients[i].user_ip, ip) == 0) {
-            clients[i] = cliente;
-        }
-    }
-}
-
-int search_user(char *username, char *ip) {
-    for (int i = 0; i < cantidad_clientes; i++) {
-        if (strcmp(clients[i].username, username) == 0 && strcmp(clients[i].user_ip, ip) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-int remove_users(int index) {
+void remove_user(int index) {
     if (index < 0 || index >= cantidad_clientes) {
-        return -1;
+        return;
     }
     for (int i = index; i < cantidad_clientes - 1; i++) {
         clients[i] = clients[i + 1];
@@ -99,35 +68,23 @@ int remove_users(int index) {
     cantidad_clientes--;
 }
 
-int check_users(char *username, char *ip) {
+void broadcast_message(char *message, char *sender) {
     for (int i = 0; i < cantidad_clientes; i++) {
-        if (strcmp(clients[i].username, username) == 0 && strcmp(clients[i].user_ip, ip) == 0) {
-            return 1;
+        if (strcmp(clients[i].username, sender) != 0) {
+            Chat__MessageCommunication msg = CHAT__MESSAGE_COMMUNICATION__INIT;
+            msg.message = message;
+            msg.sender = sender;
+            msg.recipient = NULL;
+            size_t packed_size = chat__message_communication__get_packed_size(&msg);
+            uint8_t *buffer = malloc(packed_size);
+            chat__message_communication__pack(&msg, buffer);
+            send(clients[i].sockfd, buffer, packed_size, 0);
+            free(buffer);
         }
     }
-    return 0;
 }
 
-void ERRORMensaje(const char *message) {
-    perror(message);
-    exit(EXIT_FAILURE);
-}
-
-void handle_incoming_message(uint8_t *buffer, size_t len) {
-    Chat__MessageCommunication *received_message = chat__message_communication__unpack(NULL, len, buffer);
-    if (received_message == NULL) {
-        printf("[CLIENT-ERROR]: Failed to unpack message\n");
-        return;
-    }
-    if (received_message->recipient == NULL) {
-        printf("[BROADCAST] %s: %s\n", received_message->sender, received_message->message);
-    } else {
-        printf("[DM] %s: %s\n", received_message->sender, received_message->message);
-    }
-    chat__message_communication__free_unpacked(received_message, NULL);
-}
-
-void *handle_newclient(void *arg) {
+void *handle_client(void *arg) {
     int client_socket = *(int *)arg;
 
     uint8_t buffer[1024];
@@ -137,60 +94,114 @@ void *handle_newclient(void *arg) {
         perror("[SERVER-ERROR]: Recepción de cliente fallida\n");
         exit(EXIT_FAILURE);
     } else {
-        Chat__UserRegistration *new_client = chat__user_registration__unpack(NULL, bytes_received, buffer);
-        if (new_client == NULL) {
-            perror("[SERVER-ERROR]: Registro de usuario fallido\n");
+        Chat__ClientPetition *request = chat__client_petition__unpack(NULL, bytes_received, buffer);
+        if (request == NULL) {
+            perror("[SERVER-ERROR]: Desempaquetado de solicitud de cliente fallido\n");
             exit(EXIT_FAILURE);
         }
-        printf("Ingreso usuario: %s | IP: (%s)\n", new_client->username, new_client->ip);
-        Client user;
-        strcpy(user.username, new_client->username);
-        strcpy(user.user_ip, new_client->ip);
-        user.status = 1;
-        user.sockfd = client_socket;
-        Chat__UserInfo user_response;
-        chat__user_info__init(&user_response);
-        user_response.username = user.username;
-        user_response.ip = user.user_ip;
-        user_response.status = getStatusString(user.status);
-        int user_exist = check_users(new_client->username, new_client->ip);
-        if (user_exist == 0) {
-            clients[cantidad_clientes] = user;
-            cantidad_clientes++;
-            Chat__ServerResponse answer;
-            chat__server_response__init(&answer);
-            answer.option = 1;  // Registration response
-            answer.code = 200;  // Success
-            answer.servermessage = "Usuario registrado";
-            answer.userinforesponse = &user_response;
-            printf("[SERVER (200)]->[CLIENT %s]: %s\n", answer.userinforesponse->username, answer.servermessage);
-            size_t package_size = chat__server_response__get_packed_size(&answer);
-            uint8_t *buffer_envioA = malloc(package_size);
-            chat__server_response__pack(&answer, buffer_envioA);
-            if (send(client_socket, buffer_envioA, package_size, 0) < 0) {
-                perror("[SERVER-ERROR]: Envío de respuesta fallido\n");
-                exit(EXIT_FAILURE);
+
+        switch (request->option) {
+            case 1: { // User registration
+                char *username = request->registration->username;
+                char *ip = request->registration->ip;
+
+                pthread_mutex_lock(&mutex);
+                int user_exist = 0;
+                for (int i = 0; i < cantidad_clientes; i++) {
+                    if (strcmp(clients[i].username, username) == 0) {
+                        user_exist = 1;
+                        break;
+                    }
+                }
+
+                if (!user_exist) {
+                    Client new_client;
+                    strcpy(new_client.username, username);
+                    strcpy(new_client.user_ip, ip);
+                    new_client.status = 1;
+                    new_client.sockfd = client_socket;
+                    clients[cantidad_clientes++] = new_client;
+
+                    Chat__ServerResponse response = CHAT__SERVER_RESPONSE__INIT;
+                    response.option = 1;  // Registration response
+                    response.code = 200;  // Success
+                    response.servermessage = "Usuario registrado";
+                    response.userinforesponse = NULL;  // No se necesita desempaquetar aquí
+
+                    size_t packed_size = chat__server_response__get_packed_size(&response);
+                    uint8_t *response_buffer = malloc(packed_size);
+                    chat__server_response__pack(&response, response_buffer);
+                    send(client_socket, response_buffer, packed_size, 0);
+                    free(response_buffer);
+                } else {
+                    Chat__ServerResponse response = CHAT__SERVER_RESPONSE__INIT;
+                    response.option = 1;  // Registration response
+                    response.code = 400;  // User already registered
+                    response.servermessage = "Usuario ya registrado";
+                    response.userinforesponse = NULL;  // No se necesita desempaquetar aquí
+
+                    size_t packed_size = chat__server_response__get_packed_size(&response);
+                    uint8_t *response_buffer = malloc(packed_size);
+                    chat__server_response__pack(&response, response_buffer);
+                    send(client_socket, response_buffer, packed_size, 0);
+                    free(response_buffer);
+                }
+                pthread_mutex_unlock(&mutex);
+                break;
             }
-            free(buffer_envioA);
-            // Handling client options here...
-        } else {
-            Chat__ServerResponse answer;
-            chat__server_response__init(&answer);
-            answer.option = 1;  // Registration response
-            answer.code = 400;  // User already registered
-            answer.servermessage = "Usuario ya registrado";
-            answer.userinforesponse = &user_response;
-            printf("[SERVER (400)]->[CLIENT %s]: %s\n", answer.userinforesponse->username, answer.servermessage);
-            size_t package_size = chat__server_response__get_packed_size(&answer);
-            uint8_t *buffer_envioA = malloc(package_size);
-            chat__server_response__pack(&answer, buffer_envioA);
-            if (send(client_socket, buffer_envioA, package_size, 0) < 0) {
-                perror("[SERVER-ERROR]: Envío de respuesta fallido\n");
-                exit(EXIT_FAILURE);
+            case 2: { // Change status
+                char *username = request->change->username;
+                char *status = request->change->status;
+
+                pthread_mutex_lock(&mutex);
+                for (int i = 0; i < cantidad_clientes; i++) {
+                    if (strcmp(clients[i].username, username) == 0) {
+                        if (strcmp(status, "En línea") == 0) {
+                            clients[i].status = 1;
+                        } else if (strcmp(status, "Ocupado") == 0) {
+                            clients[i].status = 2;
+                        } else if (strcmp(status, "Desconectado") == 0) {
+                            clients[i].status = 3;
+                            remove_user(i);
+                        }
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&mutex);
+                break;
             }
-            free(buffer_envioA);
+            case 3: { // Message communication
+                char *message = request->messagecommunication->message;
+                char *sender = request->messagecommunication->sender;
+                char *recipient = request->messagecommunication->recipient;
+
+                pthread_mutex_lock(&mutex);
+                if (recipient == NULL) {
+                    broadcast_message(message, sender);
+                } else {
+                    for (int i = 0; i < cantidad_clientes; i++) {
+                        if (strcmp(clients[i].username, recipient) == 0) {
+                            Chat__MessageCommunication msg = CHAT__MESSAGE_COMMUNICATION__INIT;
+                            msg.message = message;
+                            msg.sender = sender;
+                            msg.recipient = recipient;
+                            size_t packed_size = chat__message_communication__get_packed_size(&msg);
+                            uint8_t *buffer = malloc(packed_size);
+                            chat__message_communication__pack(&msg, buffer);
+                            send(clients[i].sockfd, buffer, packed_size, 0);
+                            free(buffer);
+                            break;
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&mutex);
+                break;
+            }
+            default:
+                break;
         }
-        chat__user_registration__free_unpacked(new_client, NULL);
+
+        chat__client_petition__free_unpacked(request, NULL);
     }
 
     close(client_socket);
@@ -203,7 +214,8 @@ int main(int argc, char *argv[]) {
     pthread_t thread_id;
 
     if ((server_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        ERRORMensaje("[SERVER-ERROR]: Creación de socket fallida");
+        perror("[SERVER-ERROR]: Creación de socket fallida");
+        exit(EXIT_FAILURE);
     }
 
     server_address.sin_family = AF_INET;
@@ -211,11 +223,13 @@ int main(int argc, char *argv[]) {
     server_address.sin_port = htons(8080);
 
     if (bind(server_socket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-        ERRORMensaje("[SERVER-ERROR]: Bind fallido");
+        perror("[SERVER-ERROR]: Bind fallido");
+        exit(EXIT_FAILURE);
     }
 
     if (listen(server_socket, 5) < 0) {
-        ERRORMensaje("[SERVER-ERROR]: Listen fallido");
+        perror("[SERVER-ERROR]: Listen fallido");
+        exit(EXIT_FAILURE);
     }
 
     printf("[SERVER]: Esperando conexiones...\n");
@@ -223,10 +237,11 @@ int main(int argc, char *argv[]) {
     while (1) {
         socklen_t client_address_length = sizeof(client_address);
         if ((client_socket = accept(server_socket, (struct sockaddr *)&client_address, &client_address_length)) < 0) {
-            ERRORMensaje("[SERVER-ERROR]: Aceptación de conexión fallida");
+            perror("[SERVER-ERROR]: Aceptación de conexión fallida");
+            exit(EXIT_FAILURE);
         }
 
-        pthread_create(&thread_id, NULL, handle_newclient, (void *)&client_socket);
+        pthread_create(&thread_id, NULL, handle_client, (void *)&client_socket);
     }
 
     close(server_socket);
